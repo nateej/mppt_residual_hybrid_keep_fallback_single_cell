@@ -648,6 +648,11 @@ class DriftMonitor:
         if len(self.buf) == 0:
             return {"drift_alert": False}
         df = pd.DataFrame(self.buf)
+        # ===== MODIFIED SECTION (PATCH 4): candidate drift stats must use learned-candidate rows only =====
+        if "candidate_fields_are_learned" in df:
+            learned_df = df[df["candidate_fields_are_learned"] == 1]
+        else:
+            learned_df = df.iloc[0:0]
         current = {
             "avg_sigma": float(df["sigma_vhat"].mean()),
             "fallback_rate": float(df["fallback"].mean()),
@@ -662,10 +667,11 @@ class DriftMonitor:
         feature_z = {}
         strong_feature = []
         for col in ["local_escalation_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]:
-            if col in df and col in self.baseline.get("feature_means", {}):
+            source_df = learned_df if col in ("candidate_disagreement", "mean_candidate_score") else df
+            if col in source_df and col in self.baseline.get("feature_means", {}) and len(source_df) > 0:
                 mu0 = self.baseline["feature_means"][col]
                 sd0 = max(self.baseline["feature_stds"].get(col, 1e-6), 1e-6)
-                z = abs(float(df[col].mean()) - float(mu0)) / sd0
+                z = abs(float(source_df[col].mean()) - float(mu0)) / sd0
                 feature_z[col] = float(z)
                 if z >= cfg.drift_feature_strong_z:
                     strong_feature.append(col)
@@ -709,6 +715,24 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
     x_flat_tr, x_scalar_tr, x_seq_tr, yv_tr, ys_tr, ycv_tr, ycvd_tr, ycr_tr = train_arrays
     x_flat_va, x_scalar_va, x_seq_va, yv_va, ys_va, ycv_va, ycvd_va, ycr_va = val_arrays
 
+    # ===== MODIFIED SECTION (PATCH 3): fail-fast shape checks before each training stage =====
+    assert len(x_flat_tr) == len(x_scalar_tr) == len(x_seq_tr) == len(yv_tr) == len(ys_tr) == len(ycv_tr) == len(ycvd_tr) == len(ycr_tr), (
+        f"[{stage}] train arrays misaligned lengths: "
+        f"x_flat={len(x_flat_tr)}, x_scalar={len(x_scalar_tr)}, x_seq={len(x_seq_tr)}, "
+        f"yv={len(yv_tr)}, ys={len(ys_tr)}, ycv={len(ycv_tr)}, ycvd={len(ycvd_tr)}, ycr={len(ycr_tr)}"
+    )
+    assert len(x_flat_va) == len(x_scalar_va) == len(x_seq_va) == len(yv_va) == len(ys_va) == len(ycv_va) == len(ycvd_va) == len(ycr_va), (
+        f"[{stage}] val arrays misaligned lengths: "
+        f"x_flat={len(x_flat_va)}, x_scalar={len(x_scalar_va)}, x_seq={len(x_seq_va)}, "
+        f"yv={len(yv_va)}, ys={len(ys_va)}, ycv={len(ycv_va)}, ycvd={len(ycvd_va)}, ycr={len(ycr_va)}"
+    )
+    assert ycv_tr.shape[1] == cfg.num_candidates, f"[{stage}] y_cand_v width {ycv_tr.shape[1]} != cfg.num_candidates {cfg.num_candidates}"
+    assert ycvd_tr.shape[1] == cfg.num_candidates, f"[{stage}] y_cand_valid width {ycvd_tr.shape[1]} != cfg.num_candidates {cfg.num_candidates}"
+    assert ycr_tr.shape[1] == cfg.num_candidates, f"[{stage}] y_cand_rank_target width {ycr_tr.shape[1]} != cfg.num_candidates {cfg.num_candidates}"
+    assert ycv_va.shape[1] == cfg.num_candidates, f"[{stage}] val y_cand_v width {ycv_va.shape[1]} != cfg.num_candidates {cfg.num_candidates}"
+    assert ycvd_va.shape[1] == cfg.num_candidates, f"[{stage}] val y_cand_valid width {ycvd_va.shape[1]} != cfg.num_candidates {cfg.num_candidates}"
+    assert ycr_va.shape[1] == cfg.num_candidates, f"[{stage}] val y_cand_rank_target width {ycr_va.shape[1]} != cfg.num_candidates {cfg.num_candidates}"
+
     epochs = cfg.pretrain_epochs if stage == "pretrain" else cfg.finetune_epochs
     lr = cfg.lr_pretrain if stage == "pretrain" else cfg.lr_finetune
 
@@ -720,7 +744,8 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
 
     for ep in range(1, epochs + 1):
         model.train()
-        x_flat_aug, x_scalar_aug, x_seq_aug, yv_aug, ys_aug = augment_train_arrays(train_arrays, cfg)
+        # ===== MODIFIED SECTION (PATCH 1/2): augmentation now returns full 8-array tuple =====
+        x_flat_aug, x_scalar_aug, x_seq_aug, yv_aug, ys_aug, ycv_aug, ycvd_aug, ycr_aug = augment_train_arrays(train_arrays, cfg)
         idx = np.random.permutation(len(x_flat_aug))
         for st in range(0, len(idx), cfg.batch_size):
             b = idx[st:st + cfg.batch_size]
@@ -732,9 +757,9 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             yb = torch.tensor(yv_aug[b], device=cfg.device)
             sb = torch.tensor(ys_aug[b], device=cfg.device)
 
-            ycv = torch.tensor(ycv_tr[b], device=cfg.device)
-            ycvd = torch.tensor(ycvd_tr[b], device=cfg.device)
-            ycr = torch.tensor(ycr_tr[b], device=cfg.device)
+            ycv = torch.tensor(ycv_aug[b], device=cfg.device)
+            ycvd = torch.tensor(ycvd_aug[b], device=cfg.device)
+            ycr = torch.tensor(ycr_aug[b], device=cfg.device)
             mu, logvar, slogit, cand_v, cand_rank_logits, cand_valid_logits = model(xb, xs, xq)
             main_vmpp_loss = hetero_regression_loss(yb, mu, logvar).mean()
             unc_loss = torch.zeros((), device=cfg.device)
@@ -798,7 +823,8 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
 
 def augment_train_arrays(train_arrays, cfg: Config):
     """PATCH 7: lightweight physically-plausible augmentation on TRAIN arrays only."""
-    x_flat, x_scalar, x_seq, yv, ys = train_arrays
+    # ===== MODIFIED SECTION (PATCH 1): accept/return full multitask tuple; augment features only =====
+    x_flat, x_scalar, x_seq, yv, ys, y_cand_v, y_cand_valid, y_cand_rank_target = train_arrays
     xf = x_flat.copy()
     xs = x_scalar.copy()
     xq = x_seq.copy()
@@ -827,7 +853,16 @@ def augment_train_arrays(train_arrays, cfg: Config):
         xf[:, 3:3 + cfg.k_samples] = xq[:, 0, :]
         xf[:, 3 + cfg.k_samples:3 + 2 * cfg.k_samples] = xq[:, 1, :]
 
-    return xf.astype(np.float32), xs.astype(np.float32), xq.astype(np.float32), yv, ys
+    return (
+        xf.astype(np.float32),
+        xs.astype(np.float32),
+        xq.astype(np.float32),
+        yv,
+        ys,
+        y_cand_v,
+        y_cand_valid,
+        y_cand_rank_target,
+    )
 
 
 def model_predict_api(
@@ -1904,8 +1939,11 @@ def rows_to_arrays(rows: List[Dict]):
 
 def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
     mode_sha = float((df["mode"] == "SHADE_GMPPT").mean()) if "mode" in df else np.nan
-    cand_accept = float(df["candidate_accept"].mean()) if "candidate_accept" in df else np.nan
-    mean_cand_score = float(df["mean_candidate_score"].mean()) if "mean_candidate_score" in df else np.nan
+    # ===== MODIFIED SECTION (PATCH 4): candidate utility metrics must ignore LOCAL_TRACK placeholders =====
+    learned_mask = (df["candidate_fields_are_learned"] == 1) if "candidate_fields_are_learned" in df else pd.Series(False, index=df.index)
+    learned_df = df[learned_mask].copy()
+    cand_accept = float(learned_df["candidate_accept"].mean()) if ("candidate_accept" in learned_df and len(learned_df) > 0) else np.nan
+    mean_cand_score = float(learned_df["mean_candidate_score"].mean()) if ("mean_candidate_score" in learned_df and len(learned_df) > 0) else np.nan
     return {
         "average_tracking_efficiency": float(df["efficiency"].mean()),
         "average_power_ratio": float(df["ratio"].mean()),
@@ -1921,11 +1959,14 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "candidate_accept_rate": cand_accept,
         "mean_candidate_score": mean_cand_score,
         "mean_candidate_confidence_deprecated_alias": mean_cand_score,
-        "used_ml_candidates_rate": float(df["used_ml_candidates"].mean()) if "used_ml_candidates" in df else np.nan,
-        "used_fallback_scan_rate": float(df["used_fallback_scan"].mean()) if "used_fallback_scan" in df else np.nan,
-        "learned_top_candidate_avoids_fallback_pct": float(100.0 * ((df["candidate_accept"] == 1) & (df["fallback"] == 0)).mean()) if "candidate_accept" in df else np.nan,
-        "candidate_set_contains_usable_near_gmpp_start_pct": float(100.0 * (df["best_candidate_pre_refine_power"] >= 0.98 * df["best_candidate_post_refine_power"]).mean()) if "best_candidate_pre_refine_power" in df else np.nan,
-        "rescued_by_widened_scan_after_candidate_failure_pct": float(100.0 * ((df["fallback"] == 1) & (df["candidate_reject_reason"] != "not_evaluated_local_track")).mean()) if "fallback" in df else np.nan,
+        "used_ml_candidates_rate": float(learned_df["used_ml_candidates"].mean()) if ("used_ml_candidates" in learned_df and len(learned_df) > 0) else np.nan,
+        "used_fallback_scan_rate": float(learned_df["used_fallback_scan"].mean()) if ("used_fallback_scan" in learned_df and len(learned_df) > 0) else np.nan,
+        "learned_top_candidate_avoids_fallback_pct": float(100.0 * ((learned_df["candidate_accept"] == 1) & (learned_df["fallback"] == 0)).mean()) if ("candidate_accept" in learned_df and len(learned_df) > 0) else np.nan,
+        "candidate_set_contains_usable_near_gmpp_start_pct": float(100.0 * (learned_df["best_candidate_pre_refine_power"] >= 0.98 * learned_df["best_candidate_post_refine_power"]).mean()) if ("best_candidate_pre_refine_power" in learned_df and len(learned_df) > 0) else np.nan,
+        "rescued_by_widened_scan_after_candidate_failure_pct": float(100.0 * ((learned_df["fallback"] == 1) & (learned_df["candidate_reject_reason"] != "not_evaluated_local_track")).mean()) if ("fallback" in learned_df and len(learned_df) > 0) else np.nan,
+        "candidate_utility_scope": "rows_where_candidate_fields_are_learned==True",
+        "candidate_utility_rows": int(len(learned_df)),
+        "candidate_utility_rows_total": int(len(df)),
     }
 
 
