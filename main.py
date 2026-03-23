@@ -87,6 +87,7 @@ class Config:
     dynamic_efficiency_threshold: float = 0.99
     research_only_mode: bool = False
     use_micro_ml_detector: bool = True
+    micro_label_teacher_mode: str = "oracle_dense_gmpp"
     local_trigger_center_grid: Tuple[float, ...] = (0.55, 0.65, 0.75, 0.85)
     local_trigger_rollout_steps: int = 2
     local_runtime_rollout_start_fracs: Tuple[float, ...] = (0.62, 0.72, 0.82)
@@ -544,7 +545,7 @@ class DriftMonitor:
                 exceeded.append(k)
         feature_z = {}
         strong_feature = []
-        for col in ["local_shade_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]:
+        for col in ["local_escalation_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]:
             if col in df and col in self.baseline.get("feature_means", {}):
                 mu0 = self.baseline["feature_means"][col]
                 sd0 = max(self.baseline["feature_stds"].get(col, 1e-6), 1e-6)
@@ -839,6 +840,7 @@ def calibrate_local_shade_trigger_threshold(y_true: np.ndarray, y_score: np.ndar
         return {
             "local_shade_trigger_threshold": float(cfg.local_shade_trigger_threshold),
             "local_escalation_trigger_threshold": float(cfg.local_shade_trigger_threshold),
+            "local_escalation_threshold": float(cfg.local_shade_trigger_threshold),
             "local_shade_precision": 0.0,
             "local_shade_recall": 0.0,
             "local_shade_f1": 0.0,
@@ -847,6 +849,7 @@ def calibrate_local_shade_trigger_threshold(y_true: np.ndarray, y_score: np.ndar
             "local_escalation_recall": 0.0,
             "local_escalation_f1": 0.0,
             "local_escalation_bal_acc": 0.0,
+            "local_escalation_trigger_mode": "deterministic_heuristic",
             "local_trigger_calibration_mode": "runtime_rollout_state_samples",
         }
     best = {
@@ -871,6 +874,7 @@ def calibrate_local_shade_trigger_threshold(y_true: np.ndarray, y_score: np.ndar
     return {
         "local_shade_trigger_threshold": best["threshold"],
         "local_escalation_trigger_threshold": best["threshold"],
+        "local_escalation_threshold": best["threshold"],
         "local_shade_precision": best["precision"],
         "local_shade_recall": best["recall"],
         "local_shade_f1": best["f1"],
@@ -879,12 +883,58 @@ def calibrate_local_shade_trigger_threshold(y_true: np.ndarray, y_score: np.ndar
         "local_escalation_recall": best["recall"],
         "local_escalation_f1": best["f1"],
         "local_escalation_bal_acc": best["bal_acc"],
+        "local_escalation_trigger_mode": "deterministic_heuristic",
         "local_trigger_calibration_mode": "runtime_rollout_state_samples",
     }
 
 
+def runtime_candidate_acceptance_from_prediction(
+    oracle: CurveOracle,
+    pred: Dict[str, float],
+    coarse_best_v: float,
+    coarse_best_p: float,
+    ref_p: float,
+    low_confidence: int,
+    cfg: Config,
+) -> Dict[str, float]:
+    """PATCH 2: runtime-faithful candidate acceptance checks (excluding score-threshold gate)."""
+    cand_vs = [float(np.clip(vc * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc)) for vc in pred["V_candidates"]]
+    pre_powers = [float(v * oracle.measure(v)) for v in cand_vs]
+    refined = [refine_local(oracle, c, cfg) for c in cand_vs]
+    post_powers = [float(r[1]) for r in refined]
+    best_idx = int(np.argmax(post_powers)) if len(post_powers) else -1
+    best_v = float(refined[best_idx][0]) if best_idx >= 0 else float(coarse_best_v)
+    best_pre = float(pre_powers[best_idx]) if best_idx >= 0 else 0.0
+    best_post = float(post_powers[best_idx]) if best_idx >= 0 else 0.0
+    pbest = float(best_post)
+    coarse_multipeak = int("coarse_multipeak" in pred and int(pred["coarse_multipeak"]) == 1)
+    fallback_reason = "none"
+    if not np.isfinite(best_post):
+        fallback_reason = "invalid_prediction"
+    elif best_pre < cfg.fallback_sanity_ratio * coarse_best_p:
+        fallback_reason = "sanity_worse_than_coarse"
+    elif pbest < cfg.verify_ratio_threshold * coarse_best_p:
+        fallback_reason = "refine_not_better_than_coarse"
+    elif coarse_multipeak and pred["confidence"] < cfg.weak_conf_for_multipeak:
+        fallback_reason = "multipeak_weak_confidence"
+    elif pred["confidence"] < cfg.low_conf_widen_threshold:
+        fallback_reason = "low_global_confidence"
+
+    candidate_accept = int(best_post >= cfg.candidate_accept_ratio_threshold * ref_p and int(low_confidence) == 0)
+    if candidate_accept == 0 and fallback_reason == "none":
+        fallback_reason = "candidate_reject"
+    return {
+        "candidate_accept": int(candidate_accept and fallback_reason == "none"),
+        "fallback_reason": fallback_reason,
+        "best_candidate_post_refine_power": float(best_post),
+        "best_candidate_pre_refine_power": float(best_pre),
+        "best_candidate_index": int(best_idx),
+        "best_candidate_voltage": float(best_v),
+    }
+
+
 def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib: Dict[str, float], cfg: Config) -> Dict[str, float]:
-    """PATCH 3: calibrate candidate score threshold on calibration split (safety-oriented)."""
+    """PATCH 2: calibrate candidate score threshold with runtime-aligned acceptance semantics."""
     score_list = []
     good_list = []
     for r in rows_cal:
@@ -906,13 +956,20 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
         )
         cand_scores = np.asarray(pred.get("candidate_scores", pred.get("candidate_confidences", [])), dtype=float)
         mean_score = float(np.mean(cand_scores)) if len(cand_scores) else 0.0
-        cand_vs = [float(np.clip(vc * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc)) for vc in pred["V_candidates"]]
-        refined = [refine_local(oracle, c, cfg) for c in cand_vs]
-        post_powers = np.array([float(rr[1]) for rr in refined], dtype=float)
         ref_v, ref_p, _ = refine_local(oracle, coarse_best_v, cfg)
         _ = ref_v
-        best_post = float(np.max(post_powers)) if len(post_powers) else 0.0
-        success = int(best_post >= cfg.candidate_accept_ratio_threshold * ref_p)
+        low_confidence = int(pred["sigma"] >= calib["sigma_threshold"])
+        pred["coarse_multipeak"] = int(count_local_maxima(pq, 0.02) >= 2)
+        runtime_accept = runtime_candidate_acceptance_from_prediction(
+            oracle=oracle,
+            pred=pred,
+            coarse_best_v=coarse_best_v,
+            coarse_best_p=float(pq[coarse_best_idx]),
+            ref_p=float(ref_p),
+            low_confidence=low_confidence,
+            cfg=cfg,
+        )
+        success = int(runtime_accept["candidate_accept"] == 1)
         score_list.append(mean_score)
         good_list.append(success)
 
@@ -951,6 +1008,7 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
         "candidate_accept_precision": best["precision"],
         "candidate_accept_recall": best["recall"],
         "candidate_accept_f1": best["f1"],
+        "candidate_threshold_calibration_mode": "runtime_acceptance_aligned",
     }
 
 
@@ -1122,22 +1180,23 @@ def sample_local_track_centers(oracle: CurveOracle, cfg: Config) -> List[float]:
 
 
 def collect_local_track_runtime_states(rows: List[Dict], cfg: Config) -> List[Dict]:
-    """PATCH 3: runtime-faithful LOCAL_TRACK state sampler for local escalation detector."""
+    """PATCH 1: runtime-faithful LOCAL_TRACK state sampler with strong offline escalation teacher."""
     states = []
+    teacher_mode = str(getattr(cfg, "micro_label_teacher_mode", "oracle_dense_gmpp"))
     for r in rows:
         oracle = CurveOracle(r["v_curve"], r["i_curve"])
+        p_global_teacher = float(oracle.pmpp_true) if teacher_mode == "oracle_dense_gmpp" else float(run_deterministic_baseline(oracle, cfg)["final_P_best"])
         for center_v in sample_local_track_centers(oracle, cfg):
             _local_v, p_local, _ = refine_local(oracle, float(center_v), cfg)
-            global_run = run_deterministic_baseline(oracle, cfg)
-            p_global_assist = float(global_run["final_P_best"])
-            y_escalate = int(p_global_assist >= cfg.micro_escalate_ratio_threshold * max(float(p_local), 1e-9))
+            y_escalate = int(p_global_teacher >= cfg.micro_escalate_ratio_threshold * max(float(p_local), 1e-9))
             states.append({
                 "oracle": oracle,
                 "center_v": float(center_v),
                 "y_shade": int(r["y_shade"]),
                 "y_escalate": int(y_escalate),
                 "p_local": float(p_local),
-                "p_global_assist": float(p_global_assist),
+                "p_global_teacher": float(p_global_teacher),
+                "micro_label_teacher_mode": teacher_mode,
                 "center_norm": float(center_v / max(oracle.voc, 1e-9)),
             })
     return states
@@ -1174,7 +1233,7 @@ def build_micro_scan_dataset(rows: List[Dict], cfg: Config) -> Dict[str, np.ndar
 
 
 def build_micro_scan_dataset_from_states(states: List[Dict], cfg: Config) -> Dict[str, np.ndarray]:
-    """PATCH 3: single source of truth for micro runtime-state feature extraction."""
+    """PATCH 1: single source of truth for micro runtime-state feature extraction."""
     keys = ["vm_norm", "pl_norm", "p0_norm", "pr_norm", "local_spread", "local_dip", "curvature"]
     feats = []
     labels = []
@@ -1187,7 +1246,8 @@ def build_micro_scan_dataset_from_states(states: List[Dict], cfg: Config) -> Dic
     x = np.asarray(feats, dtype=np.float32) if len(feats) else np.zeros((0, len(keys)), dtype=np.float32)
     y = np.asarray(labels, dtype=np.int64) if len(labels) else np.zeros((0,), dtype=np.int64)
     c = np.asarray(centers, dtype=np.float32) if len(centers) else np.zeros((0,), dtype=np.float32)
-    return {"x": x, "y": y, "center_norm": c, "feature_names": keys}
+    teacher_mode = states[0].get("micro_label_teacher_mode", getattr(cfg, "micro_label_teacher_mode", "oracle_dense_gmpp")) if len(states) else getattr(cfg, "micro_label_teacher_mode", "oracle_dense_gmpp")
+    return {"x": x, "y": y, "center_norm": c, "feature_names": keys, "micro_label_teacher_mode": teacher_mode}
 
 
 def fit_micro_standardizer(x: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1302,6 +1362,8 @@ def calibrate_micro_escalation_threshold(micro_detector, x_cal: np.ndarray, y_ca
         "micro_escalation_recall": float(best["recall"]),
         "micro_escalation_f1": float(best["f1"]),
         "micro_escalation_bal_acc": float(best["bal_acc"]),
+        "local_escalation_threshold": float(best["threshold"]),
+        "local_escalation_trigger_mode": "micro_ml",
     }
     return out
 
@@ -1443,53 +1505,40 @@ def run_hybrid_ml_controller(
         min_cand_score = float(np.min(cand_scores)) if len(cand_scores) else 0.0
         max_cand_score = float(np.max(cand_scores)) if len(cand_scores) else 0.0
 
-        cand_vs = [float(np.clip(vc * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc)) for vc in pred["V_candidates"]]
         cand_gate_th = float(calib.get("candidate_conf_threshold_calibrated", cfg.candidate_conf_threshold))
         if mean_cand_score < cand_gate_th:
             fallback = 1
             fallback_reason = "candidate_confidence_below_threshold"
             candidate_reject_reason = "candidate_confidence_below_threshold"
             candidate_accept = 0
-            pre_powers = []
-            post_powers = []
-            refined = []
+            best_candidate_index = -1
+            best_candidate_pre_refine_power = float(ref_p)
+            best_candidate_post_refine_power = float(ref_p)
         else:
-            pre_powers = [float(v * oracle.measure(v)) for v in cand_vs]
-            refined = [refine_local(oracle, c, cfg) for c in cand_vs]
-            post_powers = [float(r[1]) for r in refined]
-        best_candidate_index = int(np.argmax(post_powers)) if len(post_powers) else -1
-        if best_candidate_index >= 0:
-            best_candidate_pre_refine_power = float(pre_powers[best_candidate_index])
-            best_candidate_post_refine_power = float(post_powers[best_candidate_index])
-            vbest = float(refined[best_candidate_index][0])
-            pbest = float(refined[best_candidate_index][1])
-
-        if fallback == 0:
-            candidate_accept = int(
-                best_candidate_post_refine_power >= cfg.candidate_accept_ratio_threshold * ref_p and low_confidence == 0
+            pred["coarse_multipeak"] = int(coarse_multipeak)
+            cand_runtime = runtime_candidate_acceptance_from_prediction(
+                oracle=oracle,
+                pred=pred,
+                coarse_best_v=coarse_best_v,
+                coarse_best_p=coarse_best_p,
+                ref_p=ref_p,
+                low_confidence=low_confidence,
+                cfg=cfg,
             )
-            candidate_reject_reason = "accepted"
+            candidate_accept = int(cand_runtime["candidate_accept"])
+            best_candidate_index = int(cand_runtime["best_candidate_index"])
+            best_candidate_pre_refine_power = float(cand_runtime["best_candidate_pre_refine_power"])
+            best_candidate_post_refine_power = float(cand_runtime["best_candidate_post_refine_power"])
+            vbest = float(cand_runtime["best_candidate_voltage"])
+            pbest = float(best_candidate_post_refine_power)
             if candidate_accept == 0:
-                if low_confidence:
-                    candidate_reject_reason = "low_confidence_candidates"
-                elif best_candidate_post_refine_power < cfg.candidate_accept_ratio_threshold * ref_p:
-                    candidate_reject_reason = "candidate_not_better_than_reference"
-                else:
-                    candidate_reject_reason = "candidate_refine_failed"
+                candidate_reject_reason = str(cand_runtime["fallback_reason"])
                 fallback = 1
                 fallback_reason = f"candidate_reject:{candidate_reject_reason}"
-
-        if fallback == 0 and (not np.isfinite(best_candidate_post_refine_power)):
-            fallback, fallback_reason = 1, "invalid_prediction"
-        if fallback == 0 and best_candidate_pre_refine_power < cfg.fallback_sanity_ratio * coarse_best_p:
-            fallback, fallback_reason = 1, "sanity_worse_than_coarse"
-            sanity_trigger = 1
-        if fallback == 0 and pbest < cfg.verify_ratio_threshold * coarse_best_p and fallback_reason == "none":
-            fallback, fallback_reason = 1, "refine_not_better_than_coarse"
-        if fallback == 0 and coarse_multipeak and pred["confidence"] < cfg.weak_conf_for_multipeak and fallback_reason == "none":
-            fallback, fallback_reason = 1, "multipeak_weak_confidence"
-        if fallback == 0 and pred["confidence"] < cfg.low_conf_widen_threshold and fallback_reason == "none":
-            fallback, fallback_reason = 1, "low_global_confidence"
+                if candidate_reject_reason == "sanity_worse_than_coarse":
+                    sanity_trigger = 1
+            else:
+                candidate_reject_reason = "accepted"
     else:
         mean_cand_score = float(np.mean(pred["candidate_scores"]))
         min_cand_score = float(np.min(pred["candidate_scores"]))
@@ -1927,6 +1976,7 @@ def summarize_center_distribution(center_norm: np.ndarray) -> Dict[str, float]:
     }
 
 local_runtime_state_summary = {
+    "micro_label_teacher_mode": str(cfg.micro_label_teacher_mode),
     "micro_runtime_state_count_train": int(len(micro_train_ds["x"])),
     "micro_runtime_state_count_cal": int(len(micro_cal_ds["x"])),
     "micro_runtime_state_count_test": int(len(micro_test_ds["x"])),
@@ -1957,12 +2007,12 @@ if cfg.use_micro_ml_detector and len(micro_train_ds["x"]) > 0 and len(micro_cal_
     }
     micro_detector_trained = True
     micro_detector_param_count = int(micro_fit["param_count"])
-    local_shade_cal = calibrate_micro_escalation_threshold(micro_detector, micro_cal_ds["x"], micro_cal_ds["y"], cfg)
+    local_escalation_cal = calibrate_micro_escalation_threshold(micro_detector, micro_cal_ds["x"], micro_cal_ds["y"], cfg)
 else:
     local_scores_cal = []
     for xx in micro_cal_ds["x"]:
         local_scores_cal.append(float(np.clip(0.55 * xx[4] + 0.30 * xx[5] + 0.15 * xx[6], 0.0, 1.0)))
-    local_shade_cal = calibrate_local_shade_trigger_threshold(micro_cal_ds["y"], np.asarray(local_scores_cal, dtype=float), cfg)
+    local_escalation_cal = calibrate_local_shade_trigger_threshold(micro_cal_ds["y"], np.asarray(local_scores_cal, dtype=float), cfg)
 if len(micro_cal_ds["x"]):
     local_runtime_scores = np.asarray([
         micro_ml_predict(micro_detector, dict(zip(micro_cal_ds["feature_names"], row)), cfg)
@@ -1972,11 +2022,11 @@ if len(micro_cal_ds["x"]):
     local_runtime_detector_metrics = compute_local_escalation_metrics(
         micro_cal_ds["y"],
         local_runtime_scores,
-        float(local_shade_cal.get("micro_escalation_threshold", local_shade_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
+        float(local_escalation_cal.get("micro_escalation_threshold", local_escalation_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
     )
 else:
     local_runtime_detector_metrics = {
-        "threshold": float(local_shade_cal.get("micro_escalation_threshold", local_shade_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
+        "threshold": float(local_escalation_cal.get("micro_escalation_threshold", local_escalation_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
         "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0},
         "precision": 0.0,
         "recall": 0.0,
@@ -1993,14 +2043,15 @@ local_runtime_detector_metrics["n_states"] = int(len(micro_cal_ds["x"]))
 local_runtime_detector_metrics["split"] = "exp_cal_rows_runtime_states"
 mlp_cal.update(mlp_shade_cal)
 cnn_cal.update(cnn_shade_cal)
-mlp_cal.update(local_shade_cal)
-cnn_cal.update(local_shade_cal)
+mlp_cal.update(local_escalation_cal)
+cnn_cal.update(local_escalation_cal)
 mlp_cal.update({
     "micro_ml_detector_trained": bool(micro_detector_trained),
     "micro_ml_detector_param_count": int(micro_detector_param_count),
     "local_runtime_state_count": int(len(micro_cal_ds["x"])),  # backward-compatible alias
     "local_runtime_center_distribution": local_runtime_state_summary.get("micro_runtime_center_distribution_cal", {}),  # backward-compatible alias
     "micro_runtime_state_summary": local_runtime_state_summary,
+    "micro_label_teacher_mode": str(cfg.micro_label_teacher_mode),
     "local_runtime_detector_metrics": local_runtime_detector_metrics,
     "micro_detector": micro_detector,
     "micro_feature_runtime_safe": True,
@@ -2011,6 +2062,7 @@ cnn_cal.update({
     "local_runtime_state_count": int(len(micro_cal_ds["x"])),  # backward-compatible alias
     "local_runtime_center_distribution": local_runtime_state_summary.get("micro_runtime_center_distribution_cal", {}),  # backward-compatible alias
     "micro_runtime_state_summary": local_runtime_state_summary,
+    "micro_label_teacher_mode": str(cfg.micro_label_teacher_mode),
     "local_runtime_detector_metrics": local_runtime_detector_metrics,
     "micro_detector": micro_detector,
     "micro_feature_runtime_safe": True,
@@ -2171,6 +2223,8 @@ print("\n=== 9B) shade detector report ===")
 print(shade_detector_report)
 local_escalation_detector_report = {
     "task": "local_track_escalation_detector",
+    "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
+    "local_escalation_threshold": {"mlp": local_eval_threshold_mlp, "cnn": local_eval_threshold_cnn},
     "thresholds": {"mlp": local_eval_threshold_mlp, "cnn": local_eval_threshold_cnn},
     "mlp_route_metrics": local_metrics_mlp,
     "cnn_route_metrics": local_metrics_cnn,
@@ -2205,7 +2259,7 @@ df_mlp_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=mlp, stdz=std
 df_cnn_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
 
 def build_drift_baseline(df_ctrl: pd.DataFrame):
-    feature_cols = ["local_shade_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]
+    feature_cols = ["local_escalation_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]
     baseline_mean_candidate = float(df_ctrl["mean_candidate_score"].mean()) if "mean_candidate_score" in df_ctrl else np.nan
     return {
         "rate_means": {
@@ -2221,6 +2275,8 @@ def build_drift_baseline(df_ctrl: pd.DataFrame):
         "mean_candidate_score_baseline": baseline_mean_candidate,
         "mean_candidate_confidence_baseline_deprecated_alias": baseline_mean_candidate,
         "candidate_disagreement_baseline": float(df_ctrl["candidate_disagreement"].mean()) if "candidate_disagreement" in df_ctrl else np.nan,
+        "local_escalation_score_baseline": float(df_ctrl["local_escalation_score"].mean()) if "local_escalation_score" in df_ctrl else np.nan,
+        "local_shade_score_baseline": float(df_ctrl["local_escalation_score"].mean()) if "local_escalation_score" in df_ctrl else np.nan,
         "sigma_vhat_baseline": float(df_ctrl["sigma_vhat"].mean()) if "sigma_vhat" in df_ctrl else np.nan,
         "fallback_reason_hist_baseline": df_ctrl["fallback_reason"].value_counts(normalize=True).to_dict(),
     }
@@ -2361,6 +2417,7 @@ final_recommendation = {
     # PATCH 5: explicit audit labels for candidate/local detector modes.
     "candidate_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_confidence_mode": "deterministic_score_not_model_predicted",
+    "candidate_design_decision": "intentional_engineering_choice_deterministic_candidates",
     "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
@@ -2400,8 +2457,8 @@ print({
         "cnn": {k: cnn_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
     },
     "candidate_score_threshold_calibration": {
-        "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
-        "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
+        "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
+        "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
     },
     "local_escalation_trigger_threshold_calibration": {
         "mlp": {
@@ -2432,6 +2489,7 @@ print({
     "micro_local_escalation_detector": {
         "micro_ml_detector_trained": bool(mlp_cal.get("micro_ml_detector_trained", False)),
         "micro_ml_detector_param_count": int(mlp_cal.get("micro_ml_detector_param_count", 0)),
+        "micro_label_teacher_mode": str(mlp_cal.get("micro_label_teacher_mode", cfg.micro_label_teacher_mode)),
         "micro_escalation_threshold": float(mlp_cal.get("micro_escalation_threshold", np.nan)),
         "micro_escalation_precision": float(mlp_cal.get("micro_escalation_precision", np.nan)),
         "micro_escalation_recall": float(mlp_cal.get("micro_escalation_recall", np.nan)),
@@ -2694,6 +2752,7 @@ if SAVE_MODEL_BUNDLE:
         "micro_local_escalation_detector": {
             "micro_ml_detector_trained": bool(micro_detector_trained),
             "micro_ml_detector_param_count": int(micro_detector_param_count),
+            "micro_label_teacher_mode": str(mlp_cal.get("micro_label_teacher_mode", cfg.micro_label_teacher_mode)),
             "micro_escalation_threshold": float(mlp_cal.get("micro_escalation_threshold", np.nan)),
             "micro_escalation_precision": float(mlp_cal.get("micro_escalation_precision", np.nan)),
             "micro_escalation_recall": float(mlp_cal.get("micro_escalation_recall", np.nan)),
@@ -2720,8 +2779,8 @@ if SAVE_MODEL_BUNDLE:
         "local_runtime_center_distribution": local_runtime_state_summary.get("micro_runtime_center_distribution_cal", {}),
         "local_runtime_detector_metrics": local_runtime_detector_metrics,
         "candidate_score_threshold_calibration": {
-            "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
-            "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
+            "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
+            "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
         },
         "split_metadata": split_info,
         "test_set_mode": test_set_mode,
@@ -2731,6 +2790,7 @@ if SAVE_MODEL_BUNDLE:
         "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
         "shade_detection_modes": shade_detection_modes,
         "shade_detector_report": shade_detector_report,
+        "local_escalation_detector_report": local_escalation_detector_report,
         "drift_baselines": {"mlp": drift_baseline_mlp, "cnn": drift_baseline_cnn},
         "drift_thresholds": {
             "window": cfg.drift_window,
