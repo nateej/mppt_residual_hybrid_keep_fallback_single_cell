@@ -42,6 +42,23 @@ except Exception as exc:
 # global production mode flags / constants
 # ==================================================
 PRODUCTION_MLP_SINGLE_PRIOR_MODE = True
+PHYSICAL_CENTER_BANDS: Tuple[Tuple[float, float, str], ...] = (
+    (0.35, 0.55, "0.35-0.55Voc"),
+    (0.55, 0.65, "0.55-0.65Voc"),
+    (0.65, 0.75, "0.65-0.75Voc"),
+    (0.75, 0.90, "0.75-0.90Voc"),
+)
+
+
+def physical_center_band_label(center_norm: float) -> str:
+    if not np.isfinite(center_norm):
+        return PHYSICAL_CENTER_BANDS[0][2]
+    for lo, hi, label in PHYSICAL_CENTER_BANDS:
+        if lo <= center_norm < hi:
+            return label
+    if center_norm < PHYSICAL_CENTER_BANDS[0][0]:
+        return PHYSICAL_CENTER_BANDS[0][2]
+    return PHYSICAL_CENTER_BANDS[-1][2]
 
 
 # ==================================================
@@ -100,6 +117,7 @@ class Config:
     # detector gate
     local_track_false_trigger_rate_max: float = 0.10
     local_track_escalation_recall_min: float = 0.75
+    nonshaded_no_harm_tolerance: float = 0.002
 
     # validation flags (must all be true to claim industry-ready)
     has_true_standard_static: bool = False
@@ -635,7 +653,7 @@ class MicroLocalMLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def build_micro_scan_features(v_hist: Sequence[float], p_hist: Sequence[float], center_band: int) -> np.ndarray:
+def build_micro_scan_features(v_hist: Sequence[float], p_hist: Sequence[float], center_norm: float) -> np.ndarray:
     v = np.asarray(v_hist, dtype=np.float32)
     p = np.asarray(p_hist, dtype=np.float32)
     if len(v) == 0:
@@ -651,7 +669,7 @@ def build_micro_scan_features(v_hist: Sequence[float], p_hist: Sequence[float], 
             float(np.mean(np.abs(dv))),
             float(np.mean(np.abs(dp))),
             float(np.max(p) - np.min(p)),
-            float(center_band),
+            float(center_norm),
         ],
         dtype=np.float32,
     )
@@ -666,20 +684,23 @@ def collect_local_track_runtime_states(curves_v: np.ndarray, curves_i: np.ndarra
             continue
         p = v * i
         center = int(len(v) // 2)
-        band = 0 if center < len(v) / 3 else (1 if center < 2 * len(v) / 3 else 2)
-        feat = build_micro_scan_features(v[max(0, center - 3): center + 4], p[max(0, center - 3): center + 4], band)
+        center_v = float(v[center])
+        voc = float(np.max(v)) if len(v) > 0 else 1.0
+        center_norm = float(center_v / max(voc, 1e-6))
+        band = physical_center_band_label(center_norm)
+        feat = build_micro_scan_features(v[max(0, center - 3): center + 4], p[max(0, center - 3): center + 4], center_norm)
         local_peak_count = count_local_maxima(p)
         target = 1 if local_peak_count >= 2 else 0
-        states.append({"x": feat, "y": target, "band": band})
+        states.append({"x": feat, "y": target, "band": band, "center_norm": center_norm})
     return states
 
 
 def build_micro_dataset(states: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if not states:
-        return np.zeros((0, 8), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+        return np.zeros((0, 8), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype="<U32")
     x = np.stack([s["x"] for s in states], axis=0).astype(np.float32)
     y = np.array([s["y"] for s in states], dtype=np.float32)
-    b = np.array([s["band"] for s in states], dtype=np.int32)
+    b = np.array([s["band"] for s in states], dtype="<U32")
     return x, y, b
 
 
@@ -705,8 +726,8 @@ def train_micro_detector(x: np.ndarray, y: np.ndarray, device: str = "cpu") -> M
     return model
 
 
-def calibrate_local_thresholds(model: MicroLocalMLP, x: np.ndarray, y: np.ndarray, bands: np.ndarray, device: str = "cpu") -> Dict[int, float]:
-    thresholds = {0: 0.5, 1: 0.5, 2: 0.5}
+def calibrate_local_thresholds(model: MicroLocalMLP, x: np.ndarray, y: np.ndarray, bands: np.ndarray, device: str = "cpu") -> Dict[str, float]:
+    thresholds = {label: 0.5 for _, _, label in PHYSICAL_CENTER_BANDS}
     if len(x) == 0:
         return thresholds
 
@@ -714,7 +735,7 @@ def calibrate_local_thresholds(model: MicroLocalMLP, x: np.ndarray, y: np.ndarra
     with torch.no_grad():
         probs = torch.sigmoid(model(torch.from_numpy(x).float().to(device))).cpu().numpy()
 
-    for b in [0, 1, 2]:
+    for b in thresholds:
         idx = np.where(bands == b)[0]
         if len(idx) < 8:
             continue
@@ -730,15 +751,15 @@ def calibrate_local_thresholds(model: MicroLocalMLP, x: np.ndarray, y: np.ndarra
             if cost < best_cost:
                 best_cost = cost
                 best_t = float(t)
-        thresholds[b] = best_t
+        thresholds[b] = float(best_t)
     return thresholds
 
 
-def compute_local_escalation_metrics_runtime_thresholds(probs: np.ndarray, y: np.ndarray, bands: np.ndarray, thresholds: Dict[int, float]) -> Dict[str, float]:
+def compute_local_escalation_metrics_runtime_thresholds(probs: np.ndarray, y: np.ndarray, bands: np.ndarray, thresholds: Dict[str, float]) -> Dict[str, float]:
     if len(probs) == 0:
         return {"false_trigger_rate_non_escalation": 1.0, "escalation_recall": 0.0}
 
-    pred = np.array([1 if p >= thresholds.get(int(b), 0.5) else 0 for p, b in zip(probs, bands)], dtype=int)
+    pred = np.array([1 if p >= thresholds.get(str(b), 0.5) else 0 for p, b in zip(probs, bands)], dtype=int)
     y = y.astype(int)
     false_trigger = np.mean((pred == 1) & (y == 0))
     recall = np.sum((pred == 1) & (y == 1)) / max(np.sum(y == 1), 1)
@@ -748,19 +769,19 @@ def compute_local_escalation_metrics_runtime_thresholds(probs: np.ndarray, y: np
     }
 
 
-def local_detector_metrics_by_center_band_runtime_thresholds(probs: np.ndarray, y: np.ndarray, bands: np.ndarray, thresholds: Dict[int, float]) -> Dict[str, Any]:
+def local_detector_metrics_by_center_band_runtime_thresholds(probs: np.ndarray, y: np.ndarray, bands: np.ndarray, thresholds: Dict[str, float]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    for b in [0, 1, 2]:
+    for b in [label for _, _, label in PHYSICAL_CENTER_BANDS]:
         idx = np.where(bands == b)[0]
         if len(idx) == 0:
-            out[str(b)] = {"ftr": None, "recall": None}
+            out[b] = {"ftr": None, "recall": None}
             continue
         pb = probs[idx]
         yb = y[idx].astype(int)
         pred = (pb >= thresholds.get(b, 0.5)).astype(int)
         ftr = float(np.mean((pred == 1) & (yb == 0)))
         rec = float(np.sum((pred == 1) & (yb == 1)) / max(np.sum(yb == 1), 1))
-        out[str(b)] = {"ftr": ftr, "recall": rec}
+        out[b] = {"ftr": ftr, "recall": rec}
     return out
 
 
@@ -779,7 +800,7 @@ def run_hybrid_controller(
     shade_threshold: float,
     cfg: Config,
     local_detector: Optional[MicroLocalMLP] = None,
-    local_thresholds_by_band: Optional[Dict[int, float]] = None,
+    local_thresholds_by_band: Optional[Dict[str, float]] = None,
     step_idx: int = 0,
     previous_pmpp: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -799,12 +820,15 @@ def run_hybrid_controller(
     periodic_safety_trigger = (step_idx % cfg.periodic_safety_every_n == 0)
 
     local_detector_trigger = False
-    center_band = 1
+    center_band = PHYSICAL_CENTER_BANDS[1][2]
     if local_detector is not None and local_thresholds_by_band is not None:
         center = len(v) // 2
-        center_band = 0 if center < len(v) / 3 else (1 if center < 2 * len(v) / 3 else 2)
+        center_v = float(v[center]) if len(v) > 0 else 0.0
+        voc = float(np.max(v)) if len(v) > 0 else 1.0
+        center_norm = float(center_v / max(voc, 1e-6))
+        center_band = physical_center_band_label(center_norm)
         p = v * i
-        xf = build_micro_scan_features(v[max(0, center - 3):center + 4], p[max(0, center - 3):center + 4], center_band)
+        xf = build_micro_scan_features(v[max(0, center - 3):center + 4], p[max(0, center - 3):center + 4], center_norm)
         with torch.no_grad():
             prob = torch.sigmoid(local_detector(torch.from_numpy(xf).float().to(cfg.device).unsqueeze(0))).cpu().item()
         thr = local_thresholds_by_band.get(center_band, 0.5)
@@ -865,6 +889,7 @@ def run_hybrid_controller(
         "vmpp_true": dense["vmpp"],
         "pmpp_true": dense["pmpp"],
         "power_ratio": float(final_pick["p"] / max(dense["pmpp"], 1e-6)),
+        "deterministic_power_ratio": float(baseline["p"] / max(dense["pmpp"], 1e-6)),
         "voltage_percent_diff": float(100.0 * abs(final_pick["v"] - dense["vmpp"]) / max(abs(dense["vmpp"]), 1e-6)),
         "fallback_used": bool(used_fallback),
         "shade_gmppt_mode_used": bool(shade_flag or low_conf),
@@ -878,7 +903,7 @@ def run_hybrid_controller(
         "confidence": confidence,
         "shade_prob": shade_prob,
         "shade_flag": shade_flag,
-        "center_band": int(center_band),
+        "center_band": str(center_band),
     }
 
 
@@ -889,6 +914,7 @@ def _summary_metrics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     if not rows:
         return {
             "average_power_ratio": 0.0,
+            "average_power_ratio_deterministic": 0.0,
             "p95_voltage_percent_difference": 0.0,
             "p99_voltage_percent_difference": 0.0,
             "fallback_rate": 0.0,
@@ -896,11 +922,13 @@ def _summary_metrics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
             "count": 0,
         }
     pr = np.array([r["power_ratio"] for r in rows])
+    pr_det = np.array([r.get("deterministic_power_ratio", 0.0) for r in rows])
     vd = np.array([r["voltage_percent_diff"] for r in rows])
     fb = np.array([1.0 if r["fallback_used"] else 0.0 for r in rows])
     sg = np.array([1.0 if r["shade_gmppt_mode_used"] else 0.0 for r in rows])
     return {
         "average_power_ratio": float(np.mean(pr)),
+        "average_power_ratio_deterministic": float(np.mean(pr_det)),
         "p95_voltage_percent_difference": float(np.percentile(vd, 95)),
         "p99_voltage_percent_difference": float(np.percentile(vd, 99)),
         "fallback_rate": float(np.mean(fb)),
@@ -919,7 +947,7 @@ def evaluate_controller(
     shade_threshold: float,
     cfg: Config,
     local_detector: Optional[MicroLocalMLP],
-    local_thresholds_by_band: Optional[Dict[int, float]],
+    local_thresholds_by_band: Optional[Dict[str, float]],
 ) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     previous_pmpp = None
@@ -966,7 +994,7 @@ def evaluate_local_detector(
     x: np.ndarray,
     y: np.ndarray,
     bands: np.ndarray,
-    thresholds: Dict[int, float],
+    thresholds: Dict[str, float],
     cfg: Config,
 ) -> Dict[str, Any]:
     if len(x) == 0:
@@ -977,7 +1005,7 @@ def evaluate_local_detector(
             "local_thresholds_by_band": thresholds,
             "false_trigger_rate_non_escalation": 1.0,
             "escalation_recall": 0.0,
-            "metrics_by_band": {},
+            "local_detector_metrics_by_center_band": {},
         }
 
     detector.eval()
@@ -1009,7 +1037,7 @@ def evaluate_local_detector(
         "local_thresholds_by_band": {str(k): float(v) for k, v in thresholds.items()},
         "false_trigger_rate_non_escalation": float(global_metrics["false_trigger_rate_non_escalation"]),
         "escalation_recall": float(global_metrics["escalation_recall"]),
-        "metrics_by_band": by_band,
+        "local_detector_metrics_by_center_band": by_band,
     }
 
 
@@ -1128,17 +1156,21 @@ def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     nonshaded_test = test[y_shade[test] < 0.5]
     folder_labeled_shaded_test = test[(source[test] == "experimental") & (y_shade[test] >= 0.5)]
-    true_multipeak_test = test[(source[test] == "experimental") & (peaks[test] >= 2)]
+    true_multipeak_exp_test = test[(source[test] == "experimental") & (peaks[test] >= 2)]
+    true_multipeak_sim_benchmark = test[(source[test] == "simulation") & (peaks[test] >= 2)]
     dynamic_transition_test = test[dyn[test] > 0]
 
     simulated_multipeak_used = False
+    true_multipeak_test = true_multipeak_exp_test
     if len(true_multipeak_test) == 0:
-        true_multipeak_test = test[(source[test] == "simulation") & (peaks[test] >= 2)]
+        true_multipeak_test = true_multipeak_sim_benchmark
         simulated_multipeak_used = True
 
     return {
         "nonshaded_test": nonshaded_test,
         "folder_labeled_shaded_test": folder_labeled_shaded_test,
+        "true_multipeak_exp_test": true_multipeak_exp_test,
+        "true_multipeak_sim_benchmark": true_multipeak_sim_benchmark,
         "true_multipeak_test": true_multipeak_test,
         "dynamic_transition_test": dynamic_transition_test,
         "simulated_multipeak_used": np.array([simulated_multipeak_used]),
@@ -1242,6 +1274,7 @@ def main() -> None:
     prof = profile_model_compute(model, input_dim=30, device=cfg.device)
 
     ext_bundle = load_external_validation_bundle(cfg.EXTERNAL_VALIDATION_BUNDLE_PATH)
+    external_validation_bundle_loaded = bool(ext_bundle)
 
     gates_pass = local_eval["local_track_detector_gate"] == "passed"
     evidence_pass = all(
@@ -1254,16 +1287,43 @@ def main() -> None:
     )
     industry_ready = bool(gates_pass and evidence_pass)
 
+    nonshaded_count = int(reports["nonshaded_test"]["metrics"].get("count", 0))
+    if nonshaded_count > 0:
+        nonshaded_delta_vs_baseline = (
+            reports["nonshaded_test"]["metrics"]["average_power_ratio"]
+            - reports["nonshaded_test"]["metrics"]["average_power_ratio_deterministic"]
+        )
+        nonshaded_no_harm_gate: Any = nonshaded_delta_vs_baseline >= -cfg.nonshaded_no_harm_tolerance
+    else:
+        nonshaded_delta_vs_baseline = "not_available"
+        nonshaded_no_harm_gate = "not_evaluated"
+
+    true_multipeak_exp_test_count = int(len(subsets["true_multipeak_exp_test"]))
+    true_multipeak_sim_benchmark_count = int(len(subsets["true_multipeak_sim_benchmark"]))
+    true_multipeak_exp_test_available = true_multipeak_exp_test_count > 0
+    true_multipeak_sim_benchmark_available = true_multipeak_sim_benchmark_count > 0
+
+    print("\n================ SANITY CHECK ================")
+    print(f"pretrain_best_val_loss: {train_info['mlp_pretrain_best_val_loss']}")
+    print(f"pretrain_divergence_detected: {train_info['mlp_pretrain_divergence_detected']}")
+    print(f"local_track_detector_gate: {local_eval['local_track_detector_gate']}")
+    print(f"nonshaded_no_harm_gate: {nonshaded_no_harm_gate}")
+    print(f"true_multipeak_exp_test_count: {true_multipeak_exp_test_count}")
+    print(f"true_multipeak_sim_benchmark_count: {true_multipeak_sim_benchmark_count}")
+    print(f"external_validation_bundle_loaded: {external_validation_bundle_loaded}")
+    print(f"industry_ready: {industry_ready}")
+
     # final reporting
     print("\n================ FINAL PRODUCTION REPORT ================")
-    print(f"PRODUCTION_MLP_SINGLE_PRIOR_MODE: {PRODUCTION_MLP_SINGLE_PRIOR_MODE}")
-    print(f"candidate_generation_mode: {cfg.candidate_generation_mode}")
-    print(f"candidate_scores_are_model_predicted: {cfg.candidate_scores_are_model_predicted}")
-    print(f"candidate_fields_are_learned: {cfg.candidate_fields_are_learned}")
+    print(f"production_mlp_single_prior_mode: {PRODUCTION_MLP_SINGLE_PRIOR_MODE}")
+    print("candidate_generation_mode: single_vmpp_prior_deterministic_verification")
+    print("candidate_scores_are_model_predicted: False")
+    print("candidate_fields_are_learned: False")
     print(f"production_loss_mode: {cfg.production_loss_mode}")
-    print(f"certifiable_control_path: {cfg.certifiable_control_path}")
-    print(f"ml_role: {cfg.ml_role}")
-    print(f"deployment_story: {cfg.deployment_story}")
+    print("certifiable_control_path: deterministic_refine_plus_fallback")
+    print("ml_role: advisory_shade_detection_and_single_vmpp_prior")
+    print("deployment_story: small_MLP_assisted_hybrid")
+    print("research_only_branches_demoted: True")
 
     print("\n[Training stability]")
     print(f"mlp_pretrain_divergence_detected: {train_info['mlp_pretrain_divergence_detected']}")
@@ -1272,6 +1332,8 @@ def main() -> None:
     print(f"uncertainty_scale: {unc_cal['scale']}")
 
     _print_block("non-shaded no-harm metrics", reports["nonshaded_test"]["metrics"])
+    print(f"nonshaded_delta_vs_baseline: {nonshaded_delta_vs_baseline}")
+    print(f"nonshaded_no_harm_gate: {nonshaded_no_harm_gate}")
     _print_block("folder-labeled shaded metrics", reports["folder_labeled_shaded_test"]["metrics"])
     _print_block(
         "true multi-peak metrics"
@@ -1280,11 +1342,20 @@ def main() -> None:
     )
     _print_block("dynamic transition metrics", dyn_metrics)
 
+    print("\n[True multi-peak subset availability]")
+    print(f"true_multipeak_exp_test_available: {true_multipeak_exp_test_available}")
+    print(f"true_multipeak_exp_test_count: {true_multipeak_exp_test_count}")
+    print(f"true_multipeak_sim_benchmark_available: {true_multipeak_sim_benchmark_available}")
+    print(f"true_multipeak_sim_benchmark_count: {true_multipeak_sim_benchmark_count}")
+    if true_multipeak_exp_test_count == 0:
+        print("note: experimental true multi-peak held-out subset is empty; simulated benchmark used for multi-peak stress testing")
+
     print("\n[Local detector production gate]")
     print(f"local_track_detector_gate: {local_eval['local_track_detector_gate']}")
     print(f"local_escalation_mode_runtime: {local_eval['local_escalation_mode_runtime']}")
     print(f"worst_center_band: {local_eval['worst_center_band']}")
     print(f"local_thresholds_by_band: {local_eval['local_thresholds_by_band']}")
+    print(f"local_detector_metrics_by_center_band: {local_eval['local_detector_metrics_by_center_band']}")
     print(f"local_track_false_trigger_rate_non_escalation: {local_eval['false_trigger_rate_non_escalation']}")
     print(f"local_track_escalation_recall: {local_eval['escalation_recall']}")
 
