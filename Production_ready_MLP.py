@@ -592,15 +592,21 @@ def _run_epoch(
 
 
 def train_production_mlp(
-    x_train: np.ndarray,
-    yv_train: np.ndarray,
-    ys_train: np.ndarray,
-    x_val: np.ndarray,
-    yv_val: np.ndarray,
-    ys_val: np.ndarray,
+    x_train_pre: np.ndarray,
+    yv_train_pre: np.ndarray,
+    ys_train_pre: np.ndarray,
+    x_val_pre: np.ndarray,
+    yv_val_pre: np.ndarray,
+    ys_val_pre: np.ndarray,
+    x_train_ft: np.ndarray,
+    yv_train_ft: np.ndarray,
+    ys_train_ft: np.ndarray,
+    x_val_ft: np.ndarray,
+    yv_val_ft: np.ndarray,
+    ys_val_ft: np.ndarray,
     cfg: Config,
 ) -> Tuple[ProductionMLP, Dict[str, Any]]:
-    model = ProductionMLP(input_dim=x_train.shape[1], dropout=cfg.dropout).to(cfg.device)
+    model = ProductionMLP(input_dim=x_train_pre.shape[1], dropout=cfg.dropout).to(cfg.device)
 
     history: Dict[str, Any] = {
         "mlp_pretrain_divergence_detected": False,
@@ -608,7 +614,7 @@ def train_production_mlp(
         "mlp_pretrain_last_good_epoch": -1,
     }
 
-    x_pre, yv_pre, ys_pre = augment_train_arrays(x_train, yv_train, ys_train)
+    x_pre, yv_pre, ys_pre = augment_train_arrays(x_train_pre, yv_train_pre, ys_train_pre)
 
     tr_pre = TensorDataset(
         torch.from_numpy(x_pre).float(),
@@ -616,9 +622,9 @@ def train_production_mlp(
         torch.from_numpy(ys_pre).float(),
     )
     va_ds = TensorDataset(
-        torch.from_numpy(x_val).float(),
-        torch.from_numpy(yv_val).float(),
-        torch.from_numpy(ys_val).float(),
+        torch.from_numpy(x_val_pre).float(),
+        torch.from_numpy(yv_val_pre).float(),
+        torch.from_numpy(ys_val_pre).float(),
     )
 
     tr_loader = DataLoader(tr_pre, batch_size=cfg.batch_size, shuffle=True)
@@ -661,19 +667,25 @@ def train_production_mlp(
     # stage 2: experimental fine-tune
     optimizer2 = torch.optim.AdamW(model.parameters(), lr=cfg.finetune_lr, weight_decay=cfg.weight_decay)
     tr_ft = TensorDataset(
-        torch.from_numpy(x_train).float(),
-        torch.from_numpy(yv_train).float(),
-        torch.from_numpy(ys_train).float(),
+        torch.from_numpy(x_train_ft).float(),
+        torch.from_numpy(yv_train_ft).float(),
+        torch.from_numpy(ys_train_ft).float(),
     )
     tr_ft_loader = DataLoader(tr_ft, batch_size=cfg.batch_size, shuffle=True)
+    va_ft_ds = TensorDataset(
+        torch.from_numpy(x_val_ft).float(),
+        torch.from_numpy(yv_val_ft).float(),
+        torch.from_numpy(ys_val_ft).float(),
+    )
+    va_ft_loader = DataLoader(va_ft_ds, batch_size=cfg.batch_size, shuffle=False)
 
     best_state2 = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    best_val2 = _run_epoch(model, va_loader, None, cfg)
+    best_val2 = _run_epoch(model, va_ft_loader, None, cfg)
     bad_epochs = 0
 
     for _epoch in range(cfg.finetune_epochs):
         _ = _run_epoch(model, tr_ft_loader, optimizer2, cfg)
-        val_loss = _run_epoch(model, va_loader, None, cfg)
+        val_loss = _run_epoch(model, va_ft_loader, None, cfg)
         if val_loss < best_val2:
             best_val2 = val_loss
             best_state2 = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -1249,12 +1261,15 @@ def _prepare_features(dataset: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     y_vmpp_norm = (y_vmpp / np.maximum(vocs, 1e-6)).astype(np.float32)
     y_vmpp_norm = np.clip(y_vmpp_norm, 0.0, 1.0)
 
-    valid_indices = np.where(valid_mask)[0]
+    sim_idx = np.where(valid_mask & np.isin(source_domain, ["simulation", "sim"]))[0]
+    exp_idx = np.where(valid_mask & np.isin(source_domain, ["experimental", "exp"]))[0]
     rng = np.random.default_rng(cfg.seed)
-    rng.shuffle(valid_indices)
-    split = _safe_index_split(valid_indices)
+    rng.shuffle(sim_idx)
+    rng.shuffle(exp_idx)
+    sim_split = _safe_index_split(sim_idx, train=0.85, val=0.15)
+    exp_split = _safe_index_split(exp_idx, train=0.70, val=0.15)
 
-    stats = fit_standardizer(x[split["train"]])
+    stats = fit_standardizer(x[sim_split["train"]])
     x_std = apply_standardizer(x, stats).astype(np.float32)
 
     return {
@@ -1269,12 +1284,13 @@ def _prepare_features(dataset: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
         "dynamic_flags": dynamic_flags,
         "vocs": vocs,
         "dense_peak_count": dense_peak_count,
-        "split": split,
+        "sim_split": sim_split,
+        "exp_split": exp_split,
     }
 
 
 def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
-    test = prep["split"]["test"]
+    test = prep["exp_split"]["test"]
     y_shade = prep["y_shade"]
     source = prep["source_domain"]
     peaks = prep["dense_peak_count"]
@@ -1329,21 +1345,41 @@ def main() -> None:
 
     dataset = load_dataset(cfg)
     prep = _prepare_features(dataset, cfg)
+    assert len(prep["sim_split"]["train"]) > 0, "sim_split['train'] is empty"
+    assert len(prep["sim_split"]["val"]) > 0, "sim_split['val'] is empty"
+    assert len(prep["exp_split"]["train"]) > 0, "exp_split['train'] is empty"
+    assert len(prep["exp_split"]["val"]) > 0, "exp_split['val'] is empty"
+    assert len(prep["exp_split"]["test"]) > 0, "exp_split['test'] is empty"
+    assert np.all(np.isin(prep["source_domain"][prep["sim_split"]["train"]], ["simulation", "sim"]))
+    assert np.all(np.isin(prep["source_domain"][prep["exp_split"]["train"]], ["experimental", "exp"]))
+    assert np.all(np.isin(prep["source_domain"][prep["exp_split"]["test"]], ["experimental", "exp"]))
 
-    split = prep["split"]
+    sim_split = prep["sim_split"]
+    exp_split = prep["exp_split"]
     x_std = prep["x_std"]
     yv = prep["y_vmpp_norm"]
     ys = prep["y_shade"]
 
     model, train_info = train_production_mlp(
-        x_std[split["train"]], yv[split["train"]], ys[split["train"]],
-        x_std[split["val"]], yv[split["val"]], ys[split["val"]], cfg,
+        x_train_pre=x_std[sim_split["train"]],
+        yv_train_pre=yv[sim_split["train"]],
+        ys_train_pre=ys[sim_split["train"]],
+        x_val_pre=x_std[sim_split["val"]],
+        yv_val_pre=yv[sim_split["val"]],
+        ys_val_pre=ys[sim_split["val"]],
+        x_train_ft=x_std[exp_split["train"]],
+        yv_train_ft=yv[exp_split["train"]],
+        ys_train_ft=ys[exp_split["train"]],
+        x_val_ft=x_std[exp_split["val"]],
+        yv_val_ft=yv[exp_split["val"]],
+        ys_val_ft=ys[exp_split["val"]],
+        cfg=cfg,
     )
 
     model.eval()
     with torch.no_grad():
         va_pred = model.predict_production(
-            torch.from_numpy(x_std[split["val"]]).float().to(cfg.device),
+            torch.from_numpy(x_std[exp_split["val"]]).float().to(cfg.device),
             shade_threshold=cfg.shade_threshold_default,
             logvar_min=cfg.logvar_min,
             logvar_max=cfg.logvar_max,
@@ -1351,11 +1387,11 @@ def main() -> None:
             sigma_high=cfg.uncertainty_sigma_high,
         )
 
-    unc_cal = calibrate_uncertainty(va_pred["sigma"], np.abs(va_pred["vhat"] - yv[split["val"]]))
-    shade_thr = calibrate_shade_threshold(va_pred["shade_prob"], ys[split["val"]])
+    unc_cal = calibrate_uncertainty(va_pred["sigma"], np.abs(va_pred["vhat"] - yv[exp_split["val"]]))
+    shade_thr = calibrate_shade_threshold(va_pred["shade_prob"], ys[exp_split["val"]])
 
     # micro detector pipeline
-    local_states = collect_local_track_runtime_states(prep["curves_v"][split["train"]], prep["curves_i"][split["train"]])
+    local_states = collect_local_track_runtime_states(prep["curves_v"][exp_split["train"]], prep["curves_i"][exp_split["train"]])
     mx, my, mb = build_micro_dataset(local_states)
     micro = train_micro_detector(mx, my, device=cfg.device)
 
@@ -1387,31 +1423,46 @@ def main() -> None:
         reports[name] = rep
 
     shade_head_test = model.predict_production(
-        torch.from_numpy(x_std[split["test"]]).float().to(cfg.device),
+        torch.from_numpy(x_std[exp_split["test"]]).float().to(cfg.device),
         shade_threshold=shade_thr,
         logvar_min=cfg.logvar_min,
         logvar_max=cfg.logvar_max,
         sigma_low=cfg.uncertainty_sigma_low,
         sigma_high=cfg.uncertainty_sigma_high,
     )
-    shade_eval = evaluate_coarse_shade_head(shade_head_test["shade_prob"], ys[split["test"]], shade_thr)
+    shade_eval = evaluate_coarse_shade_head(shade_head_test["shade_prob"], ys[exp_split["test"]], shade_thr)
 
     dyn_metrics = evaluate_dynamic_scenarios(reports["dynamic_transition_test"]["rows"])
     prof = profile_model_compute(model, input_dim=30, device=cfg.device)
 
     ext_bundle = load_external_validation_bundle(cfg.EXTERNAL_VALIDATION_BUNDLE_PATH)
     external_validation_bundle_loaded = bool(ext_bundle)
+    external_validation_bundle_source = cfg.EXTERNAL_VALIDATION_BUNDLE_PATH if external_validation_bundle_loaded else "not_loaded"
+    has_true_standard_static = bool(ext_bundle.get("has_true_standard_static", cfg.has_true_standard_static))
+    has_true_standard_dynamic = bool(ext_bundle.get("has_true_standard_dynamic", cfg.has_true_standard_dynamic))
+    hil_validated = bool(ext_bundle.get("hil_validated", cfg.hil_validated))
+    frozen_firmware_release_evidence = bool(
+        ext_bundle.get("frozen_firmware_release_evidence", cfg.frozen_firmware_release_evidence)
+    )
+    assert isinstance(has_true_standard_static, bool)
+    assert isinstance(has_true_standard_dynamic, bool)
+    assert isinstance(hil_validated, bool)
+    assert isinstance(frozen_firmware_release_evidence, bool)
 
     gates_pass = local_eval["local_track_detector_gate"] == "passed"
     evidence_pass = all(
         [
-            cfg.has_true_standard_static,
-            cfg.has_true_standard_dynamic,
-            cfg.hil_validated,
-            cfg.frozen_firmware_release_evidence,
+            has_true_standard_static,
+            has_true_standard_dynamic,
+            hil_validated,
+            frozen_firmware_release_evidence,
         ]
     )
     industry_ready = bool(gates_pass and evidence_pass)
+    validation_status_summary = (
+        "Industry readiness is based on loaded external validation evidence plus runtime gates; "
+        "if the bundle is absent or incomplete, industry_ready must remain False."
+    )
 
     nonshaded_count = int(reports["nonshaded_test"]["metrics"].get("count", 0))
     if nonshaded_count > 0:
@@ -1437,6 +1488,8 @@ def main() -> None:
     print(f"true_multipeak_exp_test_count: {true_multipeak_exp_test_count}")
     print(f"true_multipeak_sim_benchmark_count: {true_multipeak_sim_benchmark_count}")
     print(f"external_validation_bundle_loaded: {external_validation_bundle_loaded}")
+    print(f"external_validation_bundle_source: {external_validation_bundle_source}")
+    print(f"evidence_pass: {evidence_pass}")
     print(f"industry_ready: {industry_ready}")
 
     # final reporting
@@ -1455,6 +1508,11 @@ def main() -> None:
     print(f"mlp_pretrain_divergence_detected: {train_info['mlp_pretrain_divergence_detected']}")
     print(f"mlp_pretrain_best_val_loss: {train_info['mlp_pretrain_best_val_loss']}")
     print(f"mlp_pretrain_last_good_epoch: {train_info['mlp_pretrain_last_good_epoch']}")
+    print(f"sim_pretrain_count: {len(sim_split['train'])}")
+    print(f"sim_pretrain_val_count: {len(sim_split['val'])}")
+    print(f"exp_finetune_count: {len(exp_split['train'])}")
+    print(f"exp_calibration_count: {len(exp_split['val'])}")
+    print(f"exp_test_count: {len(exp_split['test'])}")
     print(f"uncertainty_scale: {unc_cal['scale']}")
 
     _print_block("non-shaded no-harm metrics", reports["nonshaded_test"]["metrics"])
@@ -1490,11 +1548,15 @@ def main() -> None:
     print(f"shade_head_metrics: {shade_eval}")
 
     print("\n[Validation stack and roadmap]")
-    print(f"has_true_standard_static: {cfg.has_true_standard_static}")
-    print(f"has_true_standard_dynamic: {cfg.has_true_standard_dynamic}")
-    print(f"hil_validated: {cfg.hil_validated}")
-    print(f"frozen_firmware_release_evidence: {cfg.frozen_firmware_release_evidence}")
+    print(f"external_validation_bundle_loaded: {external_validation_bundle_loaded}")
+    print(f"external_validation_bundle_source: {external_validation_bundle_source}")
+    print(f"has_true_standard_static: {has_true_standard_static}")
+    print(f"has_true_standard_dynamic: {has_true_standard_dynamic}")
+    print(f"hil_validated: {hil_validated}")
+    print(f"frozen_firmware_release_evidence: {frozen_firmware_release_evidence}")
+    print(f"evidence_pass: {evidence_pass}")
     print(f"industry_ready: {industry_ready}")
+    print(f"validation_status_summary: {validation_status_summary}")
     print("next_scientific_milestone: measured true-multipeak dynamic campaign with certified ground truth")
     print("next_engineering_milestone: closed-loop firmware integration with watchdog and deterministic timing budget")
     print("next_validation_milestone: IEC/EN aligned static+dynamic bench plus HIL sign-off package")
